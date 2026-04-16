@@ -41,6 +41,16 @@ export default function headroomExtension(pi: ExtensionAPI) {
   const baseUrl = userUrl || `http://127.0.0.1:${port}`;
   const client = new HeadroomClient({ baseUrl, fallback: true, timeout: 15_000 });
 
+  /** Simple health check — the SDK doesn't expose one, so we hit the proxy directly. */
+  async function checkProxyHealth(): Promise<boolean> {
+    try {
+      const res = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(5_000) });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
   // ─── Session start: install/start proxy or health-check ─────────────
 
   pi.on("session_start", async (_event, ctx) => {
@@ -75,14 +85,14 @@ export default function headroomExtension(pi: ExtensionAPI) {
       }
     } else {
       // User-managed mode: just health-check
-      try {
-        await client.health();
+      const healthy = await checkProxyHealth();
+      if (healthy) {
         proxyAvailable = true;
         ctx.ui.setStatus(
           "headroom",
           ctx.ui.theme.fg("success", "✓") + ctx.ui.theme.fg("dim", " Headroom"),
         );
-      } catch {
+      } else {
         proxyAvailable = false;
         ctx.ui.setStatus(
           "headroom",
@@ -221,15 +231,15 @@ export default function headroomExtension(pi: ExtensionAPI) {
           }
         } else {
           // User-managed: just health-check
-          try {
-            await client.health();
+          const ok2 = await checkProxyHealth();
+          if (ok2) {
             proxyAvailable = true;
             ctx.ui.notify("Headroom compression enabled", "info");
             ctx.ui.setStatus(
               "headroom",
               ctx.ui.theme.fg("success", "✓") + ctx.ui.theme.fg("dim", " Headroom"),
             );
-          } catch {
+          } else {
             proxyAvailable = false;
             ctx.ui.notify("Headroom enabled but proxy is offline", "warning");
             ctx.ui.setStatus(
@@ -287,32 +297,17 @@ export default function headroomExtension(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       ctx.ui.notify(`Checking Headroom proxy at ${baseUrl}...`, "info");
 
-      try {
-        const health = await client.health();
+      const isHealthy = await checkProxyHealth();
+      if (isHealthy) {
         proxyAvailable = true;
 
         const lines = [
           `Headroom proxy: online`,
           `  URL: ${baseUrl}`,
-          `  Status: ${(health as any).status ?? "healthy"}`,
         ];
 
         if (proxyManager) {
           lines.push(`  Managed: ${proxyManager.isManaged ? "yes (started by extension)" : "no (external)"}`);
-        }
-
-        try {
-          const stats = await client.getStats();
-          if (stats) {
-            lines.push(
-              ``,
-              `Proxy session stats:`,
-              `  Requests: ${(stats as any).totalRequests ?? "n/a"}`,
-              `  Tokens saved: ${(stats as any).totalTokensSaved?.toLocaleString() ?? "n/a"}`,
-            );
-          }
-        } catch {
-          // Stats endpoint may not be available
         }
 
         ctx.ui.notify(lines.join("\n"), "info");
@@ -320,9 +315,9 @@ export default function headroomExtension(pi: ExtensionAPI) {
           "headroom",
           ctx.ui.theme.fg("success", "✓") + ctx.ui.theme.fg("dim", " Headroom"),
         );
-      } catch (error) {
+      } else {
         proxyAvailable = false;
-        const errMsg = error instanceof Error ? error.message : String(error);
+        const errMsg = "proxy did not respond";
         const helpLines = [
           `Headroom proxy offline`,
           `  URL: ${baseUrl}`,

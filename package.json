@@ -13,7 +13,7 @@
     ]
   },
   "dependencies": {
-    "headroom-ai": "file:../headroom/sdk/typescript"
+    "headroom-ai": "^0.1.0"
   },
   "peerDependencies": {
     "@mariozechner/pi-agent-core": "*",
