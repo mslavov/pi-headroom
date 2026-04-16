@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.pi/
+*.js
+*.js.map
+*.d.ts
+!src/**

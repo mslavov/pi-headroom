@@ -1,0 +1,27 @@
+{
+  "name": "pi-headroom",
+  "version": "0.1.0",
+  "description": "Transparent LLM context compression for Pi using Headroom",
+  "keywords": [
+    "pi-package"
+  ],
+  "type": "module",
+  "main": "./src/index.ts",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "dependencies": {
+    "headroom-ai": "file:../headroom/sdk/typescript"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.2"
+  }
+}
