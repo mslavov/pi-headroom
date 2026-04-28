@@ -38,7 +38,7 @@ export default function headroomExtension(pi: ExtensionAPI) {
   const autoManage = !userUrl;
   const port = parseInt(process.env.HEADROOM_PORT || "8787", 10);
   const proxyManager = autoManage ? new ProxyManager({ port }) : null;
-  const baseUrl = userUrl || `http://127.0.0.1:${port}`;
+  const baseUrl = userUrl ? `${userUrl}:${port}` : `http://127.0.0.1:${port}`;
   const client = new HeadroomClient({ baseUrl, fallback: true, timeout: 15_000 });
 
   /** Simple health check — the SDK doesn't expose one, so we hit the proxy directly. */
