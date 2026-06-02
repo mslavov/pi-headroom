@@ -11,8 +11,42 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { convertToLlm } from "@mariozechner/pi-coding-agent";
 import { HeadroomClient, compress } from "headroom-ai";
 import type { CompressResult } from "headroom-ai";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { piToOpenAI, openAIToPi } from "./format-bridge.js";
 import { ProxyManager } from "./proxy-manager.js";
+
+const LOG_DIR = join(homedir(), ".headroom", "logs");
+const LOG_FILE = join(LOG_DIR, "proxy.log");
+
+// Ensure log directory exists at module load (once).
+try { mkdirSync(LOG_DIR, { recursive: true }); } catch {}
+
+/**
+ * Append a PERF log line so `headroom perf` includes pi-headroom compression data.
+ * Format matches headroom's own PERF lines exactly.
+ */
+function logPerf(opts: {
+  model: string;
+  msgs: number;
+  tokBefore: number;
+  tokAfter: number;
+  tokSaved: number;
+  optMs: number;
+  transforms: string[];
+}): void {
+  try {
+    // Timestamp must use ',' as decimal separator for headroom's _PERF_RE regex.
+    const ts = new Date().toISOString().replace("T", " ").replace("Z", "").replace(".", ",").slice(0, 23);
+    const rid = `pi_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const transformsStr = opts.transforms.length > 0 ? [...new Set(opts.transforms)].join(" ") : "none";
+    const line = `${ts} - headroom.proxy - INFO - [${rid}] PERF model=${opts.model} msgs=${opts.msgs} tok_before=${opts.tokBefore} tok_after=${opts.tokAfter} tok_saved=${opts.tokSaved} cache_read=0 cache_write=0 cache_hit_pct=0 opt_ms=${opts.optMs.toFixed(0)} client=pi transforms=${transformsStr}\n`;
+    appendFileSync(LOG_FILE, line);
+  } catch {
+    // Best-effort — never block the compression path
+  }
+}
 
 export default function headroomExtension(pi: ExtensionAPI) {
   // ─── State ──────────────────────────────────────────────────────────
@@ -122,11 +156,27 @@ export default function headroomExtension(pi: ExtensionAPI) {
     const openaiMessages = piToOpenAI(piMessages);
     if (openaiMessages.length === 0) return;
 
+    const t0 = performance.now();
+    const model = ctx.model?.id ?? "unknown";
+
     try {
       const result: CompressResult = await compress(openaiMessages, {
         client,
-        model: ctx.model?.id ?? "gpt-4o",
+        model,
         fallback: true,
+      });
+
+      const optMs = performance.now() - t0;
+
+      // Always log PERF — even no-op compressions show up in `headroom perf`
+      logPerf({
+        model,
+        msgs: openaiMessages.length,
+        tokBefore: result.tokensBefore,
+        tokAfter: result.tokensAfter,
+        tokSaved: result.tokensSaved,
+        optMs,
+        transforms: result.transformsApplied,
       });
 
       if (!result.compressed || result.tokensSaved <= 0) {
