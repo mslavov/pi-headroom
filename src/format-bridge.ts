@@ -11,6 +11,10 @@
  *   UserMessage     { role: "user", content: string | ContentPart[] }
  *   AssistantMessage { role: "assistant", content: string | null, tool_calls?: ToolCall[] }
  *   ToolMessage     { role: "tool", content: string, tool_call_id: string }
+ *
+ * The OpenAI format has no room for provider signatures (ToolCall.thoughtSignature,
+ * TextContent.textSignature, ThinkingContent.thinkingSignature), so the reverse
+ * conversion restores them from the original Pi messages.
  */
 
 import type {
@@ -92,11 +96,10 @@ function convertUserMessage(msg: PiUserMessage): OpenAIMessage {
 
 function convertAssistantMessage(msg: PiAssistantMessage): OpenAIMessage {
   // Extract text parts (skip ThinkingContent)
-  const textParts = msg.content.filter((p): p is TextContent => p.type === "text");
-  const text = textParts.map((p) => p.text).join("");
+  const text = joinText(msg.content.filter(isTextContent));
 
   // Extract tool calls
-  const toolCalls = msg.content.filter((p): p is PiToolCall => p.type === "toolCall");
+  const toolCalls = msg.content.filter(isToolCall);
 
   const openaiMsg: any = {
     role: "assistant",
@@ -139,10 +142,14 @@ function convertToolResultMessage(msg: PiToolResultMessage): OpenAIMessage {
  *
  * Strategy: positional alignment with the original messages.
  * - If message counts match, copy structural metadata from originals, take text from compressed.
- * - If counts differ (compression merged/dropped messages), build fresh Pi messages.
+ * - If counts differ (compression merged/dropped messages), build fresh Pi messages,
+ *   recovering assistant messages from the originals by tool call id where possible.
+ *
+ * Assistant messages keep their original api/provider/model and provider-specific
+ * block fields (e.g. Gemini `thoughtSignature`), which providers require on replay.
  *
  * Note: The returned messages are used as a deep copy for a single LLM call,
- * so losing metadata (timestamps, usage) is acceptable.
+ * so losing other metadata (timestamps, usage) is acceptable.
  */
 export function openAIToPi(compressed: OpenAIMessage[], original: Message[]): Message[] {
   // If counts match, use positional alignment
@@ -151,7 +158,8 @@ export function openAIToPi(compressed: OpenAIMessage[], original: Message[]): Me
   }
 
   // Counts differ: build fresh messages
-  return compressed.map((compMsg) => buildFreshMessage(compMsg));
+  const assistantsByToolCallId = indexAssistantsByToolCallId(original);
+  return compressed.map((compMsg) => buildFreshMessage(compMsg, assistantsByToolCallId));
 }
 
 /**
@@ -194,38 +202,55 @@ function alignUserMessage(comp: OpenAIMessage & { role: "system" | "user" }, ori
   };
 }
 
+/**
+ * Rebuild an assistant message from its compressed form while keeping the
+ * original message's metadata (api/provider/model) and provider-specific block
+ * fields such as `thoughtSignature` and `textSignature`. Providers like Gemini
+ * reject replayed tool calls whose signatures were dropped, and pi-ai discards
+ * signatures on messages whose api/provider/model don't match the current model.
+ */
 function alignAssistantMessage(comp: OpenAIMessage & { role: "assistant" }, orig: Message): Message {
-  const contentParts: PiAssistantMessage["content"] = [];
+  if (orig.role !== "assistant") return buildFreshAssistantMessage(comp);
+  if (isAssistantUnchanged(comp, orig)) return orig;
 
-  // Add text content
-  const text = typeof comp.content === "string" ? comp.content : null;
-  if (text) {
-    contentParts.push({ type: "text", text });
-  }
+  const thinkingParts = orig.content.filter((p) => p.type === "thinking");
 
-  // Add tool calls
-  if (comp.tool_calls) {
-    for (const tc of comp.tool_calls) {
-      contentParts.push({
-        type: "toolCall",
-        id: tc.id,
-        name: tc.function.name,
-        arguments: safeJsonParse(tc.function.arguments),
-      });
-    }
-  }
+  // A text signature is bound to the exact original text, so only keep it when the text is unchanged.
+  const text = assistantText(comp.content);
+  const origTextParts = orig.content.filter(isTextContent);
+  const textParts: TextContent[] = text === joinText(origTextParts)
+    ? origTextParts
+    : text ? [{ type: "text", text }] : [];
 
-  // Preserve thinking content from original if it was an assistant message
-  if (orig.role === "assistant") {
-    const thinkingParts = orig.content.filter((p) => p.type === "thinking");
-    return {
-      ...orig,
-      content: [...thinkingParts, ...contentParts],
-    };
-  }
+  const origCallsById = new Map(orig.content.filter(isToolCall).map((tc) => [tc.id, tc]));
+  const toolCallParts: PiToolCall[] = (comp.tool_calls ?? []).map((tc) => ({
+    ...origCallsById.get(tc.id),
+    type: "toolCall",
+    id: tc.id,
+    name: tc.function.name,
+    arguments: safeJsonParse(tc.function.arguments),
+  }));
 
-  // Role mismatch: build fresh
-  return buildFreshAssistantMessage(comp);
+  return {
+    ...orig,
+    content: [...thinkingParts, ...textParts, ...toolCallParts],
+  };
+}
+
+/** True when compression left the assistant's text and tool calls untouched. */
+function isAssistantUnchanged(comp: OpenAIMessage & { role: "assistant" }, orig: PiAssistantMessage): boolean {
+  if (assistantText(comp.content) !== joinText(orig.content.filter(isTextContent))) return false;
+
+  const origCalls = orig.content.filter(isToolCall);
+  const compCalls = comp.tool_calls ?? [];
+  if (compCalls.length !== origCalls.length) return false;
+
+  // Compare parsed arguments: the proxy may re-serialize JSON with different whitespace.
+  return compCalls.every((tc, i) =>
+    tc.id === origCalls[i].id &&
+    tc.function.name === origCalls[i].name &&
+    JSON.stringify(safeJsonParse(tc.function.arguments)) === JSON.stringify(origCalls[i].arguments),
+  );
 }
 
 function alignToolResultMessage(comp: OpenAIMessage & { role: "tool" }, orig: Message): Message {
@@ -242,13 +267,19 @@ function alignToolResultMessage(comp: OpenAIMessage & { role: "tool" }, orig: Me
 
 // ─── Fresh message builders (when positional alignment fails) ───────────
 
-function buildFreshMessage(comp: OpenAIMessage): Message {
+type AssistantIndex = Map<string, PiAssistantMessage>;
+
+function buildFreshMessage(comp: OpenAIMessage, assistantsByToolCallId: AssistantIndex = new Map()): Message {
   switch (comp.role) {
     case "system":
     case "user":
       return buildFreshUserMessage(comp);
-    case "assistant":
-      return buildFreshAssistantMessage(comp);
+    case "assistant": {
+      const orig = comp.tool_calls
+        ?.map((tc) => assistantsByToolCallId.get(tc.id))
+        .find((msg) => msg !== undefined);
+      return orig ? alignAssistantMessage(comp, orig) : buildFreshAssistantMessage(comp);
+    }
     case "tool":
       return buildFreshToolResultMessage(comp);
     default:
@@ -316,6 +347,40 @@ function buildFreshToolResultMessage(comp: OpenAIMessage & { role: "tool" }): Pi
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
+
+type AssistantPart = PiAssistantMessage["content"][number];
+
+function isTextContent(part: AssistantPart): part is TextContent {
+  return part.type === "text";
+}
+
+function isToolCall(part: AssistantPart): part is PiToolCall {
+  return part.type === "toolCall";
+}
+
+/** Joins text blocks the same way `convertAssistantMessage` does, so results are comparable. */
+function joinText(parts: TextContent[]): string {
+  return parts.map((p) => p.text).join("");
+}
+
+function assistantText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.filter((p: any) => p?.type === "text").map((p: any) => p.text).join("");
+  }
+  return "";
+}
+
+function indexAssistantsByToolCallId(messages: Message[]): AssistantIndex {
+  const index: AssistantIndex = new Map();
+  for (const msg of messages) {
+    if (msg.role !== "assistant") continue;
+    for (const part of msg.content) {
+      if (isToolCall(part)) index.set(part.id, msg);
+    }
+  }
+  return index;
+}
 
 function safeJsonParse(str: string): Record<string, any> {
   try {
